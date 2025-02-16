@@ -117,6 +117,9 @@ class Card:
     def __repr__(self):
         return f"{self.name} ({self.TP})"
 
+    def __lt__(self, other):
+        return self.id < other.id
+
 
 class InheritEffect(type):
     """
@@ -448,6 +451,7 @@ class SpyCardsEnv:
         return self.get_state()
 
     def get_state(self):
+        # Agent is used to being player, so reverse state so that the agent is the opponent in this case
         card_ranks = {
             'Boss': 0,
             'Mini-Boss': 0,
@@ -457,23 +461,39 @@ class SpyCardsEnv:
         # card info is of size (55,)
         # deck will be (15, 55)
         state = np.zeros((15 + 1 + 5 + 4 + 1 + 1, 55))
-        for i, card in enumerate(self.player_deck):
+        for i, card in enumerate(self.opponent_deck):
             state[i] = card.one_hot()
         # tp will be (1, 9) (9 is 2-10)
         state[15, self.TP] = 1
         # hand will be (5, 55)
-        for i, card in enumerate(self.player_hand):
+        for i, card in enumerate(self.opponent_hand):
             state[15 + 1 + i] = card.one_hot()
         # o_hand will be (4, 5) (max 5 cards of 4 categories)
-        for card in self.opponent_hand:
+        for card in self.player_hand:
             card_ranks[card.category] += 1
         for i, val in enumerate(card_ranks.values()):
             state[15 + 1 + 5 + i, val] = 1
         # hp will be (1, 6) (6 is 0-5)
-        state[15 + 1 + 5 + 4, self.player_stats.HP] = 1
+        state[15 + 1 + 5 + 4, self.opponent_stats.HP] = 1
         # o_hp will be (1, 6) (6 is 0-5)
-        state[15 + 1 + 5 + 4 + 1, self.opponent_stats.HP] = 1
+        state[15 + 1 + 5 + 4 + 1, self.player_stats.HP] = 1
         return state
+
+    def from_state(self, state):
+        # OUT-OF-DATE
+        self.player_deck = []
+        self.player_hand = []
+        self.opponent_hand = []
+        for card_id, (in_deck, TP, in_hand, in_o_hand, hp, o_hp) in enumerate(state):
+            if in_deck:
+                self.player_deck.append(all_cards[card_id])
+            self.TP = TP
+            if in_hand:
+                self.player_hand.append(all_cards[card_id])
+            if in_o_hand:
+                self.opponent_hand.append(all_cards[card_id])
+            self.player_stats.HP = hp
+            self.opponent_stats.HP = o_hp
 
     def random_move(self):
         """
@@ -497,7 +517,7 @@ class SpyCardsEnv:
             possible_moves.append(i)
         return random.sample(possible_moves, k=1)[0]
 
-    def step(self, action, play_against=False):
+    def step(self, action):
         """
         Processes a move given the chosen cards for the player.
         """
@@ -505,18 +525,10 @@ class SpyCardsEnv:
         self.opponent_stats.reset()
         # Use Bug Fables enemy AI to pick enemy cards (AI works by drawing left to right until TP is depleted)
         player_chosen_cards = [self.player_hand[i] for i in self.moves[action]]
-        if not play_against:
-            TP_used = 0
-            opponent_chosen_cards = []
-            for card in self.opponent_hand:
-                if self.TP >= TP_used + card.TP:
-                    opponent_chosen_cards.append(card)
-                    TP_used += card.TP
-        else:
-            opponent_chosen_cards = [self.opponent_hand[i] for i in env.moves[agent.predict(self.get_state())[0]]]
-        # print()
-        # print(f"Player: {player_chosen_cards}")
-        # print(f"Opponent: {opponent_chosen_cards}")
+        opponent_chosen_cards = [self.opponent_hand[i] for i in env.moves[agent.predict(self.get_state())[0]]]
+        print()
+        print(f"Player: {player_chosen_cards}")
+        print(f"Opponent: {opponent_chosen_cards}")
         # Remove chosen cards from hands
         for card in player_chosen_cards:
             self.player_hand.remove(card)
@@ -579,9 +591,9 @@ class SpyCardsEnv:
         # print(f"Opponent Stats: {self.opponent_stats}")
         player_score = max(0, self.player_stats.ATK - max(0, self.opponent_stats.DEF - self.player_stats.Pierce))
         opponent_score = max(0, self.opponent_stats.ATK - max(0, self.player_stats.DEF - self.opponent_stats.Pierce))
-        # print()
-        # print(f"Player Score: {player_score}")
-        # print(f"Opponent Score: {opponent_score}")
+        print()
+        print(f"Player Score: {player_score}")
+        print(f"Opponent Score: {opponent_score}")
         # Return a reward of 1 if the GAME ends in a win for player, -1 if loss, and 0 otherwise.
         if player_score > opponent_score:
             # Player Win
@@ -616,13 +628,13 @@ class DQNAgent:
             if i == 0:
                 continue
             # Set Q-Value to -inf if it requires a card that isn't in the hand
-            if card_indices[-1] + 1 > len(env.player_hand):
+            if card_indices[-1] + 1 > len(env.opponent_hand):
                 q_values[i] = float('-inf')
                 continue
             # Set Q-value to -inf if it requires more TP than it available
             TP_used = 0
             for card_index in card_indices:
-                TP_used += env.player_hand[card_index].TP
+                TP_used += env.opponent_hand[card_index].TP
                 if TP_used > env.TP:
                     q_values[i] = float('-inf')
                     break
@@ -690,13 +702,28 @@ class Slice(tf.keras.layers.Layer):
         return tf.slice(inputs, self.begin, self.size)
 
 
+class Squeeze(tf.keras.layers.Layer):
+    def __init__(self, axis=None):
+        super().__init__()
+        self.axis = axis
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'axis': self.axis
+        })
+        return config
+
+    def call(self, inputs):
+        return tf.squeeze(inputs, self.axis)
+
+
 def create_dqn_model(input_shape, output_shape):
     # (1, 27, 55)
     # 15 + 1 + 5 + 4 + 1 + 1
     # deck will be (15, 55)
     # tp will be (1, 9) (9 is 2-10)
     # hand will be (5, 55)
-    # TODO: model can see opponent's effect category. fix.
     # o_hand will be (4, 5) (max 5 cards of 4 categories)
     # hp will be (1, 6) (6 is 0-5)
     input_layer = tf.keras.layers.Input(input_shape)
@@ -730,110 +757,6 @@ def create_dqn_model(input_shape, output_shape):
         print('Could not load weights. Did you forget to modify the architecture?')
         print(err)
     return model
-
-
-def debug():
-    def plot_text(arr):
-        m, n = arr.shape
-        for i in range(m):
-            for j in range(n):
-                plt.text(j, i, int(arr[i, j]), ha="center", va="center", color="tab:red")
-
-    def eps_graph():
-        graph = [epsilon]
-        for i in csv['Episode'][1:]:
-            if i < epsilon_decay_start or i < batch_size:
-                graph.append(epsilon)
-            else:
-                graph.append(max(graph[-1] * epsilon_decay, epsilon_min))
-        return graph
-
-    def get_moving_avg(data, period):
-        moving_avg = []
-        window_sum = 0
-        for i in csv['Episode']:
-            if i > period:
-                window_sum -= data[i - period]
-            window_sum += data[i]
-            moving_avg.append(window_sum / min(len(moving_avg) + 1, period))
-        return moving_avg
-
-    def get_moving_qnt(data, period, qnt):
-        moving_qrt = []
-        for i in csv['Episode']:
-            moving_qrt.append(np.quantile(data[max(0,i - period):i + 1], qnt))
-        return moving_qrt
-
-    agent.model.summary()
-    try:
-        csv = pd.read_csv('dqn_data.csv')
-    except FileNotFoundError:
-        return
-
-    ans = input('Display data graph? (Y/N): ')
-    if ans.lower() in {'n', 'no'}:
-        return
-    plt.subplot(2, 2, 1)
-    plt.grid(which='both')
-    c = [(r, 0, 1 - r) for r in csv['Action Ratio']]
-    c2 = ['r' if r == -1 else 'g' for r in csv['Reward']]
-    plt.scatter(list(csv['Episode']), csv['Reward'], s=1.5, c=c, label='Reward')
-    rw_avg = get_moving_avg(csv['Reward'], 300)
-    plt.plot(list(csv['Episode']), rw_avg, '-k', label=f"Avg Reward/300 Episodes")
-    plt.plot(list(csv['Episode']), get_moving_avg(csv['Reward'], 100), ':k', alpha=0.3, label=f"Avg Reward/100 Episodes")
-    # plt.ylim(-1, 10)
-    plt.title(f"Model Reward per Episode. Final AVG (300): {rw_avg[-1]:.2f}")
-    plt.legend()
-    plt.gca().set_axisbelow(True)
-
-    # plt.twinx()
-    plt.subplot(2, 2, 2)
-    plt.grid(which='both')
-    plt.scatter(list(csv['Episode']), csv['Max Q-Value'], s=1.5, c=c, label='Max Q-Value')
-    plt.plot(list(csv['Episode']), get_moving_avg(csv['Max Q-Value'], 100), '-k', label='Avg Q-Value/100 Episodes')
-    plt.title(f"Max Q-Value per Episode")
-    plt.legend()
-    plt.gca().set_axisbelow(True)
-
-    ax = plt.subplot(2, 2, 3)
-    plt.grid(which='both')
-    plt.scatter(list(csv['Episode']), csv['Loss'], s=1.5, c='g', label='DQN Loss')
-    plt.plot(list(csv['Episode']), get_moving_avg(csv['Loss'], 200), '--k', linewidth=1.5, label='Avg DQN Loss/200 Episodes')
-    plt.plot(list(csv['Episode']), get_moving_qnt(csv['Loss'], 200, 0.1), '-k', linewidth=1.5, label='10th Percentile DQN Loss/200 Episodes')
-    plt.title('DQN Loss per Episode')
-    # plt.yscale('symlog')
-    try:
-        plt.ylim(top=np.quantile(csv['Loss'][max(epsilon_decay_start, batch_size):], 0.99))
-    except ValueError:
-        pass
-    plt.ylim(ax.get_ylim()[1] / -20, ax.get_ylim()[1] * 1.6)
-    plt.legend()
-    plt.gca().set_axisbelow(True)
-
-    plt.subplot(2, 2, 4)
-    plt.grid(which='both')
-    plt.scatter(list(csv['Episode']), csv['Round Length'], s=1.5, c=c2, label='Round Length')
-    plt.plot(list(csv['Episode']), get_moving_avg(csv['Round Length'], 100), '-k', label='Avg Round Length/100 Episodes')
-    plt.legend()
-    plt.title("Round Length per Episode")
-    plt.gca().set_axisbelow(True)
-    plt.show()
-
-    plt.grid(which='both')
-    m = []
-    for x in csv['Q-Values']:
-        if type(x) is str:
-            m.append(np.argmax([float(n) for n in x.strip('[]').split(' ') if n]))
-        else:
-            m.append(np.argmax([x]))
-    plt.scatter(list(csv['Episode']), m, s=2, c=c2, label='Random Q-Value per Episode')
-    plt.xlabel('Episode')
-    plt.ylabel('Move Index')
-    plt.yticks(range(len(env.moves)), [f"{i} {hand}" for i, hand in enumerate(env.moves)])
-    plt.gca().set_axisbelow(True)
-    plt.legend()
-    plt.show()
-    quit()
 
 
 all_cards = [
@@ -935,7 +858,7 @@ all_cards = [
     Card('Venus\' Bud', 1, 'Effect', (Effect.Lifesteal(1),), {'Plant'})
 ]
 cards_by_name = {card.name: card for card in all_cards}
-p_deck = [
+o_deck = [
     cards_by_name['Devourer'],
     cards_by_name['Zasp'],
     cards_by_name['Mothiva'],
@@ -952,7 +875,7 @@ p_deck = [
     cards_by_name['Numbnail'],
     cards_by_name['Venus\' Bud']
 ]
-o_deck = [
+p_deck = [
     cards_by_name['Tidal Wyrm'],
     cards_by_name['Astotheles'],
     cards_by_name['Monsieur Scarlet'],
@@ -972,70 +895,62 @@ o_deck = [
 
 # -=- HYPERPARAMETERS -=-
 initial_episode = 0
-episodes = 30000
+episodes = 3000
 batch_size = 64
 learning_rate = 0.001
 target_update_rate = 100
 replay_buffer_size = 10000
-gamma = 0.99
+gamma = 0.95
 epsilon = 1.0
 epsilon_min = 0.00
-epsilon_decay = 0.994
+epsilon_decay = 0.99
 epsilon_decay_start = 0
 loss_limit = 30000
 check_training_rate = 100
 # -=-=-=-=-=-=-=-=-=-=-=-
-try:
-    model_data = pd.read_csv('dqn_data.csv')
-    initial_episode = model_data['Episode'].iloc[-1] + 1
-    epsilon = max(epsilon_min, epsilon_decay ** max(initial_episode - epsilon_decay_start, 0))
-except FileNotFoundError:
-    model_data = pd.DataFrame()
-
 env = SpyCardsEnv(p_deck, o_deck)
 # There are 32 different possible card hands (nCr(5,0)+nCr(5,1)...+nCr(5,5)=32)
 agent = DQNAgent(input_size=(15 + 1 + 5 + 4 + 1 + 1, 55), output_size=32)
-debug()
 
-for e in range(initial_episode, initial_episode + episodes):
-    state = env.reset()
-    done = False
-    total_reward = 0
-    model_action_sum = 0
-    max_q_val = 0
-    q_values = []
+env.player_hand = [cards_by_name['Bandit'], cards_by_name['Burglar'], cards_by_name['Ironnail'], cards_by_name['Thief']]
+env.opponent_hand = [cards_by_name['Numbnail'], cards_by_name['Zasp'], cards_by_name['Mothiva'], cards_by_name['Leafbug Archer'], cards_by_name['Leafbug Ninja']]
+# for a in range(2, 11):
+#     env.TP = a
+#     c = Counter()
+#     for _ in range(100):
+#         random.shuffle(env.player_hand)
+#         random.shuffle(env.opponent_hand)
+#         m = tuple(sorted(env.opponent_hand[i] for i in env.moves[agent.predict(env.get_state())[0]]))
+#         c[m] += 1
+#     print(env.TP)
+#     print(c)
+#     print()
+# quit()
+while True:
+    ranks = {
+        'Boss': 0,
+        'Mini-Boss': 0,
+        'Effect': 0,
+        'Battle': 0
+    }
+    for card in env.opponent_hand:
+        ranks[card.category] += 1
 
-    while not done:
-        action, was_model_action, q_val, q_vals = agent.act(state)
-        next_state, reward, done = env.step(action)
-        agent.replay_buffer.append((state, action, reward, next_state, done))
-        state = next_state
-        total_reward += reward
-        model_action_sum += was_model_action
-        max_q_val = max(max_q_val, q_val)
-        q_values.append(q_vals)
-    q_values = random.sample(q_values, k=1)[0]
-
-    loss = agent.replay(batch_size, e)
-    model_data = pd.concat([model_data, pd.DataFrame({
-        'Episode': [e],
-        'Action Ratio': [model_action_sum / env.total_rounds],
-        'Reward': [total_reward],
-        'Loss': [loss],
-        'Round Length': [env.total_rounds],
-        'Q-Values': [q_values],
-        'Max Q-Value': [max_q_val]
-    })])
-
-    if loss is None:
-        loss = 0
-    print(f"Episode: {e} - Action Ratio: {model_action_sum / env.total_rounds:.3f} ({model_action_sum}/{env.total_rounds}) - Reward: {total_reward:.2f} - Loss: {loss:.4f} - Max Q-Val: {max_q_val:.4f}")
-    if loss > loss_limit and e > max(batch_size, epsilon_decay_start):
-        print(f"Loss exceeded {loss_limit}. Quitting early...")
-        break
-
-    if (e + 1) % target_update_rate == 0:
-        agent.update_target_model()
-    if (e + 1) % 50 == 0:
-        agent.model.save('dqn_model.keras')
-        model_data.to_csv('dqn_data.csv', index=False)
+    print(f"Current TP: {env.TP}")
+    print(f"Opponent has {ranks['Boss']} Boss, {ranks['Mini-Boss']} Mini-Boss, {ranks['Effect']}, Effect, & {ranks['Battle']} Battle.")
+    print(f"Opponent HP: {env.opponent_stats.HP}")
+    print()
+    print(f"Your hand: {[card for card in env.player_hand]}")
+    print(f"Your HP: {env.player_stats.HP}")
+    print()
+    m = input('What will you play?: ')
+    if m == '':
+        indices = tuple()
+    else:
+        indices = tuple(sorted(int(i) for i in m.replace(' ', '').strip('[()]').split(',')))
+    _, _, done = env.step(env.moves.index(indices))
+    print('-------------------------------------------------')
+    if done:
+        cont = input('Continue Playing?').lower() in {'ok', 'y', 'ye', 'yes', 'sure', 'okay'}
+        if cont: break
+        else: env.reset()

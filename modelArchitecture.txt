@@ -1,0 +1,8 @@
+tur=100, batch=64, lr=0.001, gamma=0.95, eps_decay=0.99, invalid move masking
+player: devourer zaspiva leafbugs, opponent: wyrm thugbugs (model can see opponent's boss, miniboss, effect, and battle cards)
+  deck > dense 64 ---v
+    tp > dense 64 ---v
+  hand > dense 64 > concat > flatten > dense 128 L2=0.001
+o_hand > dense 64 ---^
+    hp > dense 64 ---^
+  o_hp > dense 64 ---^
