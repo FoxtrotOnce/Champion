@@ -1,7 +1,7 @@
 """Core functions and methods required to interact with a Spy Cards environment.
 
 Defines heuristics for opponent moves in Spy Cards, and ISMCTS for use with
-the neural networks.
+the models.
 Classes/methods are grouped for clarity.
 
 Spy Cards:
@@ -10,10 +10,12 @@ Spy Cards:
     Effect: Container class for all other effect subclasses.
     SpyCardsEnv: Manage mechanics for playing Spy Cards.
 
-Neural Networking:
+Heuristics:
     filter_moves: Return all valid moves that can be played.
-    MaxATKandTP: Pick the valid move with the highest ATK and TP.
+    SampleMove: Pick a random move.
     SampleWeightedMove: Pick a random move, weighed by how many cards it uses.
+    BugFablesAI: Pick a move using Bug Fables' AI.
+    MaxATKandTP: Pick the valid move with the highest ATK and TP.
     Node: Represent a Spy Cards env as an ISMCTS node.
     ISMCTS: Pick the best move to play, using ISMCTS.
 """
@@ -21,7 +23,7 @@ Neural Networking:
 import numpy as np
 from typing import Literal
 from abc import abstractmethod
-from copy import deepcopy
+from copy import deepcopy, copy
 from collections import Counter
 from itertools import combinations, chain
 from heapq import heappush, heappop
@@ -32,6 +34,8 @@ import random
 Literal_Category = Literal["Boss", "Mini-Boss", "Effect", "Battle"]
 Literal_Tribe = Literal["Spider", "Plant", "Bot", "Zombie", "Bug", "Chomper", "Fungi", "Seedling", "Mothfly", "Thug",
                         "Wasp", "Dead Lander", "Leafbug", "Midge", "Weevil"]
+tribe_names = ["Spider", "Plant", "Bot", "Zombie", "Bug", "Chomper", "Fungi", "Seedling", "Mothfly", "Thug",
+               "Wasp", "Dead Lander", "Leafbug", "Midge", "Weevil"]
 
 
 class Stats:
@@ -44,7 +48,6 @@ class Stats:
         Lifesteal (int): The player gains this much HP, if they win the round.
         Pierce (int): Ignores this much of the opponent's DEF.
         Setup (int): How much ATK the player gains next round.
-        Empower (dict[str, int]): Attack bonuses for each of the player's tribes.
     """
 
     def __init__(self):
@@ -54,26 +57,19 @@ class Stats:
         self.Lifesteal = 0
         self.Pierce = 0
         self.Setup = 0
-        self.Empower = {
-            'Spider': 0,
-            'Plant': 0,
-            'Bot': 0,
-            'Zombie': 0,
-            'Bug': 0,
-            'Chomper': 0,
-            'Fungi': 0,
-            'Seedling': 0,
-            'Mothfly': 0,
-            'Thug': 0,
-            'Wasp': 0,
-            'Dead Lander': 0,
-            'Leafbug': 0,
-            'Midge': 0,
-            'Weevil': 0
-        }
+
+    def __deepcopy__(self, memodict={}):
+        copied_stats = Stats()
+        copied_stats.HP = self.HP
+        copied_stats.ATK = self.ATK
+        copied_stats.DEF = self.DEF
+        copied_stats.Lifesteal = self.Lifesteal
+        copied_stats.Pierce = self.Pierce
+        copied_stats.Setup = self.Setup
+        return copied_stats
 
     def __repr__(self):
-        return f"ATK: {self.ATK} - DEF: {self.DEF} - PI: {self.Pierce} - LS: {self.Lifesteal}"
+        return f"HP: {self.HP} - ATK: {self.ATK} - DEF: {self.DEF} - PI: {self.Pierce} - LS: {self.Lifesteal}"
 
     def reset(self) -> None:
         """Reset all values to 0, besides HP.
@@ -86,23 +82,6 @@ class Stats:
         self.Lifesteal = 0
         self.Pierce = 0
         self.Setup = 0
-        self.Empower = {
-            'Spider': 0,
-            'Plant': 0,
-            'Bot': 0,
-            'Zombie': 0,
-            'Bug': 0,
-            'Chomper': 0,
-            'Fungi': 0,
-            'Seedling': 0,
-            'Mothfly': 0,
-            'Thug': 0,
-            'Wasp': 0,
-            'Dead Lander': 0,
-            'Leafbug': 0,
-            'Midge': 0,
-            'Weevil': 0
-        }
 
 
 class Card:
@@ -114,9 +93,19 @@ class Card:
     Cards in the Effect or Battle category are converted to Effect/Battle after
     initialization, since they appear the same in-game.
 
+    Attributes:
+        id (int): ID of this Card.
+        name (str): The name of this Card.
+        TP (int): How much TP this Card costs to play.
+        category (Literal_Category): The category this Card is in.
+        effects (tuple["Effect" ...]): Each effect this Card triggers.
+        tribes (set[Literal_Tribe]): Each tribe this Card is in.
+
     Methods:
         one_hot: Return a one-hot encoded representation of the Card.
     """
+
+    _next_card_id = 0
 
     def __init__(self, name: str, TP: int, category: Literal_Category, effects: tuple["Effect", ...],
                  tribes: set[Literal_Tribe] = None):
@@ -131,13 +120,6 @@ class Card:
         Effect.Unity gets assigned original_card_name=name to properly handle
         the Unity effect.
 
-        Args:
-            name (str): The name of this Card.
-            TP (int): How much TP this Card costs to play.
-            category (Literal_Category): The category this Card is in.
-            effects (tuple["Effect" ...]): Each effect this Card triggers.
-            tribes (set[Literal_Tribe]): Each tribe this Card is in.
-
         Raises:
             NotImplementedError: A Battle Card's effects are something other
                 than a single ATK effect.
@@ -145,6 +127,8 @@ class Card:
         if tribes is None:
             tribes = set()
 
+        self.id = Card._next_card_id
+        Card._next_card_id += 1
         self.name = name
         self.TP = TP
         self.category = category
@@ -168,37 +152,39 @@ class Card:
             self.category = 'Effect/Battle'
 
     def __repr__(self):
-        return f"{self.name} ({self.TP})"
+        return f"{self.name} (TP: {self.TP})"
 
-    def one_hot(self) -> np.ndarray:
-        """Return a one-hot encoded representation of the Card.
+    def encode(self) -> np.ndarray:
+        """Return an encoded representation of the Card.
 
         This function is provided for use with neural networks, encoding the
-        card as a one-hot array of size (54,):
+        card as an array of size (40,):
 
-        TP cost: (9) - TP cost is between 1-9, which requires 9 slots.
-        Category: (3) - 3 slots for each category (Effect/Battle are together).
-        ATK: (11) - ATK is between 0-9, and 99 for ELK, which requires 11 slots.
-        Effects: (18) - 18 slots for each effect.
-        Tribes: (13) - 13 slots for each tribe.
+        Card ID: (1) - Card ID is represented as a numeric value.
+        ATK: (1) - ATK is represented as a numeric value.
+        TP Cost: (1) - TP Cost is represented as a numeric value.
+        Category: (3) - All 3 categories are represented as one-hot.
+        Effects: (19) - The card's effects are represented as one-hot.
+        Tribes: (15) - The card's tribes are represented as one-hot.
 
         Returns:
-            np.ndarray: A (54,) one-hot encoded array representing the Card.
+            np.ndarray: A size (40,) array representing the Card.
         """
         key = {'Boss': 0, 'Mini-Boss': 1, 'Effect/Battle': 2}
-        # TP + Category + ATK + Effects + Tribes
-        state = np.zeros(9 + 3 + 11 + 18 + 13)
-        state[self.TP - 1] = 1
-        state[9 + key[self.category]] = 1
+        tribe_indices = {key: i for i, key in enumerate(tribe_names)}
         atk = 0
+        state = np.zeros(40)
+
+        state[0] = self.id + 1
         for effect in self.effects:
             if isinstance(effect, Effect.ATK):
-                atk = min(10, atk + effect.amount)
-            state[9 + 3 + 11 + effect.id] = 1
-        state[9 + 3 + atk] = 1
-        tribe_indices = {key: i for i, key in enumerate(Stats().Empower)}
+                atk += effect.amount
+            state[6 + effect.id] = 1
+        state[1] = atk / 9
+        state[2] = self.TP / 9
+        state[3 + key[self.category]] = 1
         for tribe in self.tribes:
-            state[9 + 3 + 11 + 18 + tribe_indices[tribe]] = 1
+            state[25 + tribe_indices[tribe]] = 1
         return state
 
 
@@ -213,7 +199,7 @@ class Effect:
     Attributes:
         _priority (int): The priority of the effect.
             Lower priorities get played first.
-        id (int): Arbitrary id of the effect. Used for Card.one_hot.
+        id (int): ID of the effect. Used for Card.encode.
 
     Methods:
         play: Abstract method that plays the effect onto the environment.
@@ -228,6 +214,7 @@ class Effect:
         Priority: 0 - Summon (str)
         Priority: 0 - Summon_Wasp (int)
         Priority: 0 - Carmina
+        Priority: 0 - Win_Round
 
         Priority: 1 - Coin (Effect, Effect, int)
         Priority: 1 - If_Card (str, Effect)
@@ -250,7 +237,7 @@ class Effect:
         return self._priority < other._priority
 
     @abstractmethod
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         """Applies the effect to the game environment.
@@ -289,7 +276,7 @@ class Setup(Effect):
     def __repr__(self):
         return f"Setup ({self._amount})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         p_stats.Setup += self._amount
@@ -306,7 +293,7 @@ class Heal(Effect):
     def __repr__(self):
         return f"Heal ({self._amount})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         p_stats.HP = min(5, p_stats.HP + self._amount)
@@ -325,7 +312,7 @@ class ATK(Effect):
     def __repr__(self):
         return f"ATK ({self.amount}), Battle: {self.is_battle}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         p_stats.ATK += self.amount
@@ -345,7 +332,7 @@ class DEF(Effect):
     def __repr__(self):
         return f"DEF ({self._amount})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         p_stats.DEF += self._amount
@@ -362,7 +349,7 @@ class Pierce(Effect):
     def __repr__(self):
         return f"Pierce ({self._amount})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         p_stats.Pierce += self._amount
@@ -379,7 +366,7 @@ class Lifesteal(Effect):
     def __repr__(self):
         return f"Lifesteal ({self._amount})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         p_stats.Lifesteal += self._amount
@@ -396,13 +383,13 @@ class Summon(Effect):
     def __repr__(self):
         return f"Summon {self._card_name}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         card = cards_by_name[self._card_name]
-        p_played[card.name] += 1
+        p_played[card] += 1
         for effect in card.effects:
-            heappush(queue, (is_player, effect))
+            heappush(queue, (effect, is_player))
 
 
 class Summon_Wasp(Effect):
@@ -420,7 +407,7 @@ class Summon_Wasp(Effect):
     def __repr__(self):
         return f"Summon Wasps ({self._amount})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         for _ in range(self._amount):
@@ -428,9 +415,9 @@ class Summon_Wasp(Effect):
                                   cards_by_name['Wasp Trooper'],
                                   cards_by_name['Wasp Bomber'],
                                   cards_by_name['Wasp Driller']])
-            p_played[card.name] += 1
+            p_played[card] += 1
             for effect in card.effects:
-                heappush(queue, (is_player, effect))
+                heappush(queue, (effect, is_player))
 
 
 class Carmina(Effect):
@@ -447,13 +434,13 @@ class Carmina(Effect):
     def __repr__(self):
         return f"Carmina"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         card = random.choice([card for card in all_cards if card.category == 'Mini-Boss'])
-        p_played[card.name] += 1
+        p_played[card] += 1
         for effect in card.effects:
-            heappush(queue, (is_player, effect))
+            heappush(queue, (effect, is_player))
 
 
 class Coin(Effect):
@@ -471,14 +458,14 @@ class Coin(Effect):
             return f"Coin ({self._repetitions}): {self._effect_heads}"
         return f"Coin ({self._repetitions}): {self._effect_heads}/{self._effect_tails}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         for _ in range(self._repetitions):
             if random.random() >= 0.5:
-                heappush(queue, (is_player, self._effect_heads))
+                heappush(queue, (self._effect_heads, is_player))
             elif self._effect_tails:
-                heappush(queue, (is_player, self._effect_tails))
+                heappush(queue, (self._effect_tails, is_player))
 
 
 class If_Card(Effect):
@@ -493,11 +480,12 @@ class If_Card(Effect):
     def __repr__(self):
         return f"If {self._card_name}: {self._effect}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
-        if p_played[self._card_name]:
-            heappush(queue, (is_player, self._effect))
+        card = cards_by_name[self._card_name]
+        if p_played[card]:
+            heappush(queue, (self._effect, is_player))
 
 
 class If_Tribe(Effect):
@@ -513,16 +501,15 @@ class If_Tribe(Effect):
     def __repr__(self):
         return f"If {self._tribe} ({self._amount}): {self._effect}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         tribe_cards = 0
-        for card_name, occ in p_played.items():
-            card = cards_by_name[card_name]
+        for card, occ in p_played.items():
             if self._tribe in card.tribes:
                 tribe_cards += occ
         if tribe_cards >= self._amount:
-            heappush(queue, (is_player, self._effect))
+            heappush(queue, (self._effect, is_player))
 
 
 class Per_Card(Effect):
@@ -541,11 +528,12 @@ class Per_Card(Effect):
     def __repr__(self):
         return f"Per {self._card_name}: {self._effect}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
-        for _ in range(p_played[self._card_name]):
-            heappush(queue, (is_player, self._effect))
+        card = cards_by_name[self._card_name]
+        for _ in range(p_played[card]):
+            heappush(queue, (self._effect, is_player))
 
 
 class VS(Effect):
@@ -560,13 +548,12 @@ class VS(Effect):
     def __repr__(self):
         return f"VS {self._tribe}: {self._effect}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
-        for card_name in o_played:
-            card = cards_by_name[card_name]
+        for card in o_played:
             if self._tribe in card.tribes:
-                heappush(queue, (is_player, self._effect))
+                heappush(queue, (self._effect, is_player))
                 break
 
 
@@ -582,11 +569,10 @@ class Empower(Effect):
     def __repr__(self):
         return f"Empower +{self.power} ({self._tribe})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
-        for card_name, occ in p_played.items():
-            card = cards_by_name[card_name]
+        for card, occ in p_played.items():
             if self._tribe in card.tribes:
                 p_stats.ATK += self.power * occ
 
@@ -609,21 +595,24 @@ class Unity(Effect):
     def __repr__(self):
         return f"Unity (+{self.power}, {self._tribe})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         # Don't do Unity if the same card has already played it
         if self.original_card_name in p_unities:
             return
-        for card_name, occ in p_played.items():
-            card = cards_by_name[card_name]
+        for card, occ in p_played.items():
             if self._tribe in card.tribes:
                 p_stats.ATK += self.power * occ
         p_unities.add(self.original_card_name)
 
 
 class If_ATK(Effect):
-    """If the player's ATK is (amount) or higher, queue (effect)."""
+    """If the player's ATK is (amount) or higher, queue (effect).
+
+    NOTE:
+        This effect is only used by Monsieur Scarlet.
+    """
 
     def __init__(self, amount: int, effect: "Effect"):
         self._priority = 2
@@ -634,11 +623,11 @@ class If_ATK(Effect):
     def __repr__(self):
         return f"If ATK ({self._amount}): {self._effect}"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         if p_stats.ATK >= self._amount:
-            heappush(queue, (is_player, self._effect))
+            heappush(queue, (self._effect, is_player))
 
 
 class Numb(Effect):
@@ -652,7 +641,7 @@ class Numb(Effect):
     def __repr__(self):
         return f"Numb ({self._amount})"
 
-    def play(self, is_player: bool, queue: list[tuple[bool, "Effect"]], p_unities: set[str],
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
              p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
              o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
         # While there are cards to numb (and you can numb), remove ATK from your opponent
@@ -660,6 +649,27 @@ class Numb(Effect):
         while o_numbable and amount_available > 0:
             o_stats.ATK -= heappop(o_numbable)
             amount_available -= 1
+
+
+class Win_Round(Effect):
+    """Add 99 to the player's ATK and Pierce.
+
+    NOTE:
+        This effect is only used by The Everlasting King.
+    """
+
+    def __init__(self) -> None:
+        self._priority = 0
+        self.id = 18
+
+    def __repr__(self):
+        return f"Win Round"
+
+    def play(self, is_player: bool, queue: list[tuple["Effect", bool]], p_unities: set[str],
+             p_played: Counter["Card", int], p_numbable: list[int], p_stats: "Stats",
+             o_played: Counter["Card", int], o_numbable: list[int], o_stats: "Stats") -> None:
+        heappush(queue, (Effect.ATK(99), is_player))
+        heappush(queue, (Effect.Pierce(99), is_player))
 
 
 # No other way to get IDEs to autofill subclasses without specifying them like this.
@@ -681,6 +691,7 @@ Effect.Empower = Empower
 Effect.Unity = Unity
 Effect.If_ATK = If_ATK
 Effect.Numb = Numb
+Effect.Win_Round = Win_Round
 
 
 class SpyCardsEnv:
@@ -702,13 +713,14 @@ class SpyCardsEnv:
         opponent_deck (list[Card]): Card deck the opponent draws from.
         opponent_hand (list[Card]): Cards in the opponent's hand, starting at 3.
         opponent_stats (list[Card]): The opponent's stats.
+        done (bool): If the game is finished.
         ismcts_mode (bool): If enabled, opponent drawing and playing behavior
             changes to be used for ISMCTS.
 
     Methods:
         reset: Reset the environment to an initialized state.
         get_state: Return a one-hot ndarray representing the environment.
-        step (int): Play one round of Spy Cards.
+        step: Play one round of Spy Cards.
     """
 
     def __init__(self, player_deck: list["Card"], opponent_deck: list["Card"]):
@@ -735,14 +747,29 @@ class SpyCardsEnv:
         self.opponent_deck = opponent_deck
         self.opponent_hand = None
         self.opponent_stats = None
+        self.done = False
         self.ismcts_mode = False
 
         self.reset()
 
+    def __deepcopy__(self, memodict={}):
+        copied_env = SpyCardsEnv(self.player_deck, self.opponent_deck)
+        copied_env.TP = self.TP
+        copied_env.r = random.Random()
+        copied_env.r.setstate(self.r.getstate())
+        copied_env.total_rounds = self.total_rounds
+        copied_env.player_hand = [cards_by_name[card.name] for card in self.player_hand]
+        copied_env.player_stats = deepcopy(self.player_stats)
+        copied_env.opponent_hand = [cards_by_name[card.name] for card in self.opponent_hand]
+        copied_env.opponent_stats = deepcopy(self.opponent_stats)
+        copied_env.done = self.done
+        copied_env.ismcts_mode = self.ismcts_mode
+        return copied_env
+
     def reset(self) -> np.ndarray:
         """Reset the environment to an initialized state.
 
-        Reset TP, total_rounds, hands, and stats.
+        Reset TP, total_rounds, hands, stats, and done.
         This method is provided for use with neural networks, as a new env
         doesn't need to be initialized to continue playing.
 
@@ -757,48 +784,47 @@ class SpyCardsEnv:
         self.opponent_hand = random.sample(self.opponent_deck, k=3)
         random.shuffle(self.opponent_hand)
         self.opponent_stats = Stats()
+        self.done = False
 
         return self.get_state()
 
     def get_state(self) -> np.ndarray:
-        """Return a one-hot encoded state representation of the environment.
+        """Return an encoded state representation of the environment.
 
         This function is provided for use with neural networks, encoding the
-        game state as a one-hot array of size (26, 54):
+        game state as an array of size (24, 40):
 
-        Player deck: (15, 54) - 15 rows for 15 Card objects.
-        TP: (1, 9) - TP is between 2-10, which requires 9 slots.
-        Player hand: (5, 54) - 5 rows for 5 Card objects.
-        Opponent hand: (3, 6) - 3 rows per visible card category, and 6 slots
-            for 0-5 of the counted category.
-        Player HP: (1, 6) - HP is between 0-5, which requires 6 slots.
-        Opponent HP: (1, 6): - HP is between 0-5, which requires 6 slots.
+        Player deck: (15, 40) - 15 rows for 15 Card objects.
+        Player hand: (5, 40) - 5 rows for 5 Card objects.
+        Opponent hand: (1, 3) - Numeric values counting boss, mini-boss,
+            and battle/effect cards in the opponent's hand.
+        Player HP: (1, 1) - HP is a numeric value.
+        Opponent HP: (1, 1): - HP is a numeric value.
+        TP: (1, 1) - TP is a numeric value.
 
         Returns:
-            np.ndarray: A (26, 54) one-hot encoded array representing the environment.
+            np.ndarray: A size (24, 40) encoded array representing the environment.
         """
-        card_categories = {'Boss': 0, 'Mini-Boss': 0, 'Effect/Battle': 0}
+        card_categories = {'Boss': 0, 'Mini-Boss': 1, 'Effect/Battle': 2}
         # Player deck
-        state = np.zeros((15 + 1 + 5 + 3 + 1 + 1, 54))
+        state = np.zeros((24, 40))
         for i, card in enumerate(self.player_deck):
-            state[i] = card.one_hot()
-        # TP
-        state[15, self.TP] = 1
+            state[i] = all_cards_encoded[card]
         # Player hand
         for i, card in enumerate(self.player_hand):
-            state[15 + 1 + i] = card.one_hot()
+            state[15 + i] = all_cards_encoded[card]
         # Opponent hand
         for card in self.opponent_hand:
-            card_categories[card.category] += 1
-        for i, val in enumerate(card_categories.values()):
-            state[15 + 1 + 5 + i, val] = 1
+            state[20, card_categories[card.category]] += 1 / 5
         # Player HP
-        state[15 + 1 + 5 + 3, self.player_stats.HP] = 1
+        state[21, 0] = self.player_stats.HP / 5
         # Opponent HP
-        state[15 + 1 + 5 + 3 + 1, self.opponent_stats.HP] = 1
+        state[22, 0] = self.opponent_stats.HP / 5
+        # TP
+        state[23, 0] = self.TP / 10
         return state
 
-    def step(self, action: int) -> tuple[np.ndarray, int, bool]:
+    def step(self, action: int) -> tuple[np.ndarray, float, bool]:
         """Play one round of Spy Cards.
 
         The round is played as follows:
@@ -816,8 +842,8 @@ class SpyCardsEnv:
         Returns:
             tuple[np.ndarray, int, bool]: Tuple containing round information.
                 state (np.ndarray): The environment state from get_state.
-                reward (int): The reward received.
-                done (bool): If the game has terminated.
+                reward (float): The reward received.
+                done (bool): If the game is finished.
 
         Raises:
             NotImplementedError: The TP cost of the player's move exceeds the
@@ -830,22 +856,18 @@ class SpyCardsEnv:
         TP_used = 0
         for card in player_chosen_cards:
             TP_used += card.TP
-        if TP_used > self.TP:
-            raise NotImplementedError(f"Player TP used is {TP_used}. Env only has {self.TP} TP.")
+            if TP_used > self.TP:
+                raise NotImplementedError(f"Player TP used is {TP_used}. Env only has {self.TP} TP.")
 
         if not self.ismcts_mode:
-            # Use Bug Fables enemy AI to pick enemy cards (AI works by drawing left to right until TP is depleted)
-            TP_used = 0
-            opponent_chosen_cards = []
-            for card in self.opponent_hand:
-                if self.TP >= TP_used + card.TP:
-                    opponent_chosen_cards.append(card)
-                    TP_used += card.TP
+            # Use Bug Fables enemy AI to pick enemy cards
+            opponent_chosen_cards = [self.opponent_hand[i] for i in all_moves[BugFablesAI(self.opponent_hand, self.TP)]]
+            # opponent_chosen_cards = [self.opponent_hand[i] for i in all_moves[SampleMove(self.opponent_hand, self.TP)]]
         else:
             # Guess what the opponent will play by using a heuristic
             opponent_chosen_cards = [self.opponent_hand[i] for i in all_moves[SampleWeightedMove(self.opponent_hand, self.TP)]]
-
         # print()
+        # print(f"Env TP: {self.TP}")
         # print(f"Player: {player_chosen_cards}")
         # print(f"Opponent: {opponent_chosen_cards}")
         # Remove chosen cards from hands
@@ -855,7 +877,7 @@ class SpyCardsEnv:
             self.opponent_hand.remove(card)
 
         # Set up variables needed for processing effects
-        # Queue will be (bool, Effect) pairs indicating (is_player's_effect, effect_to_play).
+        # Queue will be (Effect, bool) pairs indicating (effect_to_play, is_player's_effect).
         queue = []
 
         p_played = Counter()
@@ -864,23 +886,27 @@ class SpyCardsEnv:
         for card in player_chosen_cards:
             p_played[card] += 1
             for effect in card.effects:
-                heappush(queue, (True, effect))
+                heappush(queue, (effect, True))
         o_played = Counter()
         o_numbable = []
         o_unities = set()
         for card in opponent_chosen_cards:
             o_played[card] += 1
             for effect in card.effects:
-                heappush(queue, (False, effect))
+                heappush(queue, (effect, False))
 
         # Play effects while they exist in queue, effects with the lowest priority are played first.
         while queue:
-            is_player, effect = heappop(queue)
+            effect, is_player = heappop(queue)
             if is_player:
                 effect.play(is_player, queue, p_unities, p_played, p_numbable, self.player_stats, o_played, o_numbable, self.opponent_stats)
             else:
                 effect.play(is_player, queue, o_unities, o_played, o_numbable, self.opponent_stats, p_played, p_numbable, self.player_stats)
 
+            # print()
+            # print(f"Player Move: {is_player} - Effect: {effect}")
+            # print(f"Player Stats: {self.player_stats}")
+            # print(f"Opponent Stats: {self.opponent_stats}")
         # Raise TP, draw new cards, and determine ending scores
         self.TP = min(10, self.TP + 1)
         self.total_rounds += 1
@@ -903,27 +929,29 @@ class SpyCardsEnv:
                 available_cards[picked] -= 1
                 can_draw -= 1
 
-        # print()
-        # print(f"Player Stats: {self.player_stats}")
-        # print(f"Opponent Stats: {self.opponent_stats}")
         player_score = max(0, self.player_stats.ATK - max(0, self.opponent_stats.DEF - self.player_stats.Pierce))
         opponent_score = max(0, self.opponent_stats.ATK - max(0, self.player_stats.DEF - self.opponent_stats.Pierce))
         # print()
         # print(f"Player Score: {player_score}")
         # print(f"Opponent Score: {opponent_score}")
+        # print('-----------------------------------------------')
         # Return a reward of 1 if the GAME ends in a win for player, -1 if loss, and 0 otherwise.
         if player_score > opponent_score:
             # Player Win
             self.opponent_stats.HP -= 1
             self.player_stats.HP = min(5, self.player_stats.HP + self.player_stats.Lifesteal)
             if self.opponent_stats.HP == 0:
+                self.done = True
                 return self.get_state(), 1, True
+            return self.get_state(), 0.05, False
         elif opponent_score > player_score:
             # Opponent Win
             self.player_stats.HP -= 1
             self.opponent_stats.HP = min(5, self.opponent_stats.HP + self.opponent_stats.Lifesteal)
             if self.player_stats.HP == 0:
+                self.done = True
                 return self.get_state(), -1, True
+            return self.get_state(), -0.05, False
         return self.get_state(), 0, False
 
 
@@ -943,7 +971,7 @@ def filter_moves(hand: list["Card"], TP_limit: int) -> list[int]:
     valid_moves = []
     for i, card_indices in enumerate(all_moves):
         # Skip move if it requires a card that isn't in the hand
-        if i > 0 and card_indices[-1] + 1 > len(hand):
+        if card_indices and card_indices[-1] + 1 > len(hand):
             continue
         # Skip move if it uses more TP than available
         TP_used = 0
@@ -957,53 +985,20 @@ def filter_moves(hand: list["Card"], TP_limit: int) -> list[int]:
     return valid_moves
 
 
-def MaxATKandTP(hand: list["Card"], TP_limit: int) -> int:
-    """Pick the valid move with the highest ATK and TP.
-
-    Total ATK is prioritized first, and total TP cost is prioritized second.
-    Total ATK is calculated as the sum of the ATK, Unity, and Empower effect amounts.
-    Total TP cost is calculated as the sum of each card's TP cost.
+def SampleMove(hand: list["Card"], TP_limit: int) -> int:
+    """Pick a random move.
 
     Args:
-        hand (list[core.Card]): A list of the cards in the player's hand.
+        hand (list[Card]): A list of the cards in the player's hand.
             Used for checking available cards.
         TP_limit (int): The total TP cost of the move cannot exceed this limit.
 
     Returns:
-        int: The index of the valid move with the highest ATK and TP.
+        int: The index of the randomly picked move.
     """
-    best = -1
-    atk = -1
-    tp = -1
-    for i, move in enumerate(all_moves):
-        # Skip move if it requires hands that the move doesn't have
-        if i > 0 and move[-1] + 1 > len(hand):
-            continue
-        TP_used = 0
-        total_atk = 0
-        for card_index in move:
-            card = hand[card_index]
-            if TP_limit >= TP_used + card.TP:
-                # Add amount to total ATK if it's an ATK, Unity, or Empower effect.
-                for effect in card.effects:
-                    if isinstance(effect, Effect.ATK):
-                        total_atk += effect.amount
-                    elif isinstance(effect, Effect.Unity):
-                        total_atk += effect.power
-                    elif isinstance(effect, Effect.Empower):
-                        total_atk += effect.power
-                TP_used += card.TP
-
-        # Pick move with highest ATK
-        if total_atk > atk:
-            best = i
-            atk = total_atk
-            tp = TP_used
-        # If the ATK is equal, pick move with the highest TP
-        elif total_atk == atk and TP_used > tp:
-            best = i
-            tp = TP_used
-    return best
+    valid_moves = filter_moves(hand, TP_limit)
+    move = random.choice(valid_moves)
+    return move
 
 
 def SampleWeightedMove(hand: list["Card"], TP_limit: int) -> int:
@@ -1015,7 +1010,7 @@ def SampleWeightedMove(hand: list["Card"], TP_limit: int) -> int:
         4 Cards = (0,2,3,4) = Weight of 5
 
     Args:
-        hand (list[core.Card]): A list of the cards in the player's hand.
+        hand (list[Card]): A list of the cards in the player's hand.
             Used for checking available cards.
         TP_limit (int): The total TP cost of the move cannot exceed this limit.
 
@@ -1026,6 +1021,80 @@ def SampleWeightedMove(hand: list["Card"], TP_limit: int) -> int:
     weights = [len(all_moves[move]) + 1 for move in valid_moves]
     move = random.choices(valid_moves, weights, k=1)[0]
     return move
+
+
+def BugFablesAI(hand: list["Card"], TP_limit: int) -> int:
+    """Pick a move using Bug Fables' AI.
+
+    Cards are continuously picked from the hand, if TP is available when they
+    are iterated over.
+
+    Args:
+        hand (list[Card]): A list of the cards in the player's hand.
+            Used for checking available cards.
+        TP_limit (int): The total TP cost of the move cannot exceed this limit.
+
+    Returns:
+        list[Card]: The selected cards.
+    """
+    TP_used = 0
+    chosen_card_indices = []
+    for i, card in enumerate(hand):
+        if TP_limit >= TP_used + card.TP:
+            chosen_card_indices.append(i)
+            TP_used += card.TP
+    return all_moves.index(tuple(chosen_card_indices))
+
+
+def MaxATKandTP(hand: list["Card"], TP_limit: int) -> int:
+    """Pick the valid move with the highest ATK and TP.
+
+    Total ATK is prioritized first, and total TP cost is prioritized second.
+    Total ATK is calculated as the sum of the ATK, Unity, and Empower effect amounts.
+    Total TP cost is calculated as the sum of each card's TP cost.
+
+    Args:
+        hand (list[Card]): A list of the cards in the player's hand.
+            Used for checking available cards.
+        TP_limit (int): The total TP cost of the move cannot exceed this limit.
+
+    Returns:
+        int: The index of the valid move with the highest ATK and TP.
+    """
+    best = -1
+    atk = -1
+    tp = -1
+    for i, move in enumerate(all_moves):
+        # Skip move if it requires cards that the hand doesn't have
+        if move and move[-1] + 1 > len(hand):
+            continue
+        TP_used = 0
+        total_atk = 0
+        for card_index in move:
+            card = hand[card_index]
+            # Add amount to total ATK if it's an ATK, Unity, or Empower effect.
+            for effect in card.effects:
+                if isinstance(effect, Effect.ATK):
+                    total_atk += effect.amount
+                elif isinstance(effect, Effect.Unity):
+                    total_atk += effect.power
+                elif isinstance(effect, Effect.Empower):
+                    total_atk += effect.power
+            TP_used += card.TP
+        # Move uses too much TP and is invalid.
+        if TP_used > TP_limit:
+            continue
+
+        # Pick move with highest ATK
+        if total_atk > atk:
+            best = i
+            atk = total_atk
+            tp = TP_used
+        # If the ATK is equal, pick move with the highest TP
+        elif total_atk == atk and TP_used > tp:
+            best = i
+            tp = TP_used
+    return best
 
 
 class Node:
@@ -1042,7 +1111,7 @@ class Node:
         move (int): The move that led to this node.
         children (list[Node]): List of each child node, representing a possible
             move that can be taken from this node.
-        parent (Node): The parent node this nod ederived from.
+        parent (Node): The parent node this node derived from.
         visits (int): How many times this node has been visited during ISMCTS.
         reward (float): Accumulated reward received from child nodes.
         untried_moves (list[int]): Possible moves that have yet to be played.
@@ -1080,6 +1149,7 @@ class Node:
 
         Recursively calls repr to print each child node, using depth for better
         visualization.
+        The node is represented as Node(move_made, visits, reward).
 
         Args:
             depth (int): PROTECTED, DO NOT CHANGE. Child depth from parent.
@@ -1117,7 +1187,8 @@ class Node:
             Node: The expanded child node.
         """
         child = Node(env, move, self)
-        self.untried_moves.remove(move)
+        if self.untried_moves:
+            self.untried_moves.remove(move)
         self.children.append(child)
         return child
 
@@ -1140,7 +1211,7 @@ def ISMCTS(root_env: "SpyCardsEnv", iterations: int) -> int:
     newly drawn cards, the opponent's hand, the opponent's deck, and the
     opponent's move.
     Currently, ISMCTS cheats by knowing the opponent's deck so that an extra
-    model is not needed. This will be changed in the future.
+    policy is not needed. This will be changed in the future.
 
     The player's newly drawn cards are filled in with a preset random generator,
     so they remain consistent if the same move is played from the root.
@@ -1164,15 +1235,13 @@ def ISMCTS(root_env: "SpyCardsEnv", iterations: int) -> int:
     for card in root_env.opponent_deck:
         opponent_deck_categories[card.category].append(card)
 
-    root_hand_guess = [random.choice(opponent_deck_categories[card.category]) for card in root_env.opponent_hand]
-
     # Run ISMCTS
     for _ in range(iterations):
         node = root
         node_env = deepcopy(root_env)
         node_env.ismcts_mode = True
         node_env.r.setstate(r_state)
-        node_env.opponent_hand = root_hand_guess
+        node_env.opponent_hand = [random.choice(opponent_deck_categories[card.category]) for card in root_env.opponent_hand]
 
         # Selection (Select node if it is non-terminal and fully expanded)
         while (not node_env.done) and len(node.untried_moves) == 0:
@@ -1196,6 +1265,7 @@ def ISMCTS(root_env: "SpyCardsEnv", iterations: int) -> int:
             node.backpropagate(rw)
             node = node.parent
 
+    # root.repr()
     # Pick ISMCTS move based on child with most visits (most tried move)
     best_child = max(root.children, key=lambda child: child.visits)
     return best_child.move
@@ -1223,7 +1293,7 @@ all_cards = [
     Card('False Monarch', 5, 'Boss', (Effect.Empower(3, 'Mothfly'),), {'Bug', 'Mothfly'}),
     Card('Maki', 6, 'Boss', (Effect.ATK(6),), {'Bug'}),
     Card('Wasp King', 7, 'Boss', (Effect.Summon_Wasp(2),), {'Bug'}),
-    Card('The Everlasting King', 9, 'Boss', (Effect.ATK(99), Effect.Pierce(99)), {'Plant', 'Bug'}),
+    Card('The Everlasting King', 9, 'Boss', (Effect.Win_Round(),), {'Plant', 'Bug'}),
 
     Card('Acolyte Aria', 3, 'Mini-Boss', (Effect.ATK(1), Effect.Coin(Effect.Summon('Venus\' Bud'), repetitions=3)), {'Bug'}),
     Card('Mothiva', 2, 'Mini-Boss', (Effect.ATK(2), Effect.If_Card('Zasp', Effect.Heal(1))), {'Bug'}),
@@ -1302,4 +1372,42 @@ all_cards = [
     Card('Wasp Driller', 6, 'Effect', (Effect.ATK(4), Effect.Pierce(2)), {'Bug', 'Wasp'}),
     Card('Venus\' Bud', 1, 'Effect', (Effect.Lifesteal(1),), {'Plant'})
 ]
+all_cards_encoded = {card: card.encode() for card in all_cards}
 cards_by_name = {card.name: card for card in all_cards}
+
+
+# Define player and opponent decks
+p_deck = [
+    cards_by_name['Devourer'],
+    cards_by_name['Zasp'],
+    cards_by_name['Mothiva'],
+    cards_by_name['Leafbug Archer'],
+    cards_by_name['Leafbug Archer'],
+    cards_by_name['Leafbug Archer'],
+    cards_by_name['Leafbug Ninja'],
+    cards_by_name['Leafbug Ninja'],
+    cards_by_name['Leafbug Ninja'],
+    cards_by_name['Leafbug Ninja'],
+    cards_by_name['Leafbug Clubber'],
+    cards_by_name['Leafbug Clubber'],
+    cards_by_name['Numbnail'],
+    cards_by_name['Numbnail'],
+    cards_by_name['Venus\' Bud']
+]
+o_deck = [
+    cards_by_name['Tidal Wyrm'],
+    cards_by_name['Astotheles'],
+    cards_by_name['Monsieur Scarlet'],
+    cards_by_name['Thief'],
+    cards_by_name['Thief'],
+    cards_by_name['Thief'],
+    cards_by_name['Bandit'],
+    cards_by_name['Bandit'],
+    cards_by_name['Bandit'],
+    cards_by_name['Burglar'],
+    cards_by_name['Burglar'],
+    cards_by_name['Burglar'],
+    cards_by_name['Ironnail'],
+    cards_by_name['Ironnail'],
+    cards_by_name['Venus\' Bud']
+]
